@@ -2,7 +2,7 @@
 
 Measures the cost of RDoc eagerly syntax-highlighting and retaining every Ruby method body when the selected generator does not render method source.
 
-The benchmark uses RDoc's built-in `ri` generator by default. It does not depend on `rdoc-markdown`, so the result can justify an optimization in RDoc itself.
+The benchmark uses RDoc's built-in `ri` generator by default.
 
 ## Optimization
 
