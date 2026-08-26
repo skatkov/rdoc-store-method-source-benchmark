@@ -1,0 +1,157 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+TMP_ROOT = File.join(ROOT, "tmp")
+DEFAULT_EXCLUDE = '(?:^|/)(?:app/assets|lib/templates)/|\.(?:json|rbs|xml|xsd)\z'
+
+options = {
+  gem: "google-api-client",
+  version: "0.53.0",
+  format: "ri"
+}
+
+option_parser = OptionParser.new do |parser|
+  parser.banner = "Usage: bin/benchmark [options]"
+  parser.on("--gem NAME", "Gem to download (default: google-api-client)") { |value| options[:gem] = value }
+  parser.on("--version VERSION", "Gem version (default: 0.53.0)") { |value| options[:version] = value }
+  parser.on("--format FORMAT", "RDoc format (default: ri)") { |value| options[:format] = value }
+  parser.on("--source PATH", "Use an existing source directory") { |value| options[:source] = File.expand_path(value) }
+  parser.on("--limit FILES", Integer, "Process only the first FILES Ruby files") { |value| options[:limit] = value }
+  parser.on("-h", "--help", "Show this help") do
+    puts parser
+    exit
+  end
+end
+option_parser.parse!
+
+def run!(*command, **options)
+  return if system(*command, **options)
+
+  abort "Command failed: #{command.join(" ")}"
+end
+
+def prepare_source(options)
+  return options.fetch(:source) if options[:source]
+
+  cache = File.join(TMP_ROOT, "source")
+  source = File.join(cache, "#{options.fetch(:gem)}-#{options.fetch(:version)}")
+  return source if File.directory?(source)
+
+  FileUtils.mkdir_p(cache)
+  run!("gem", "fetch", options.fetch(:gem), "--version", options.fetch(:version), chdir: cache)
+  package = Dir[File.join(cache, "#{options.fetch(:gem)}-#{options.fetch(:version)}*.gem")].first
+  abort "Downloaded gem package was not found" unless package
+
+  run!("gem", "unpack", package, "--target", cache)
+  source
+end
+
+def profile_sample(result, label)
+  result.fetch("profile").find { |sample| sample.fetch("label") == label }
+end
+
+def output_manifest(path)
+  Dir.glob(File.join(path, "**", "*"), File::FNM_DOTMATCH).sort.filter_map do |file|
+    next unless File.file?(file)
+    next if File.basename(file) == "created.rid"
+
+    [file.delete_prefix("#{path}/"), Digest::SHA256.file(file).hexdigest]
+  end.to_h
+end
+
+def source_inputs(source, limit)
+  return ["."] unless limit
+
+  files = Dir.glob(File.join(source, "**", "*.rb")).sort.first(limit)
+  abort "No Ruby files found under #{source}" if files.empty?
+
+  files.map { |file| file.delete_prefix("#{source}/") }
+end
+
+def run_variant(name, source, inputs, options, optimized:)
+  result_root = File.join(TMP_ROOT, "results", options.fetch(:format), name)
+  output = File.join(result_root, "output")
+  profile_path = File.join(result_root, "profile.json")
+  time_path = File.join(result_root, "time.txt")
+  FileUtils.rm_rf(result_root)
+  FileUtils.mkdir_p(result_root)
+
+  rubyopt = ["-r#{File.join(ROOT, "lib/profile_rdoc")}"]
+  rubyopt << "-r#{File.join(ROOT, "lib/store_method_source")}" if optimized
+
+  env = {
+    "BUNDLE_GEMFILE" => File.join(ROOT, "Gemfile"),
+    "RDOC_PROFILE_PATH" => profile_path,
+    "RUBYOPT" => rubyopt.join(" ")
+  }
+  command = [
+    "/usr/bin/time",
+    "--format=%e %M",
+    "--output=#{time_path}",
+    "bundle", "exec", "rdoc",
+    "--format=#{options.fetch(:format)}",
+    "--output=#{output}",
+    "--quiet",
+    "--force-output",
+    "--exclude=#{DEFAULT_EXCLUDE}"
+  ] + inputs
+
+  puts "Running #{name}..."
+  run!(env, *command, chdir: source)
+  elapsed, max_rss = File.read(time_path).split.map(&:to_f)
+
+  {
+    "name" => name,
+    "elapsed_seconds" => elapsed,
+    "max_rss_kb" => max_rss.to_i,
+    "profile" => JSON.parse(File.read(profile_path)),
+    "manifest" => output_manifest(output)
+  }
+end
+
+def mib(kb) = format("%.1f MiB", kb / 1024.0)
+def percentage(before, after) = format("%.1f%%", ((before - after) * 100.0) / before)
+
+abort "/usr/bin/time is required" unless File.executable?("/usr/bin/time")
+source = prepare_source(options)
+abort "Source directory does not exist: #{source}" unless File.directory?(source)
+inputs = source_inputs(source, options[:limit])
+
+baseline = run_variant("baseline", source, inputs, options, optimized: false)
+optimized = run_variant("optimized", source, inputs, options, optimized: true)
+baseline_parse = profile_sample(baseline, "after_parse")
+optimized_parse = profile_sample(optimized, "after_parse")
+outputs_match = baseline.fetch("manifest") == optimized.fetch("manifest")
+
+report = {
+  "source" => source,
+  "input_files" => inputs == ["."] ? "all" : inputs.size,
+  "format" => options.fetch(:format),
+  "outputs_match" => outputs_match,
+  "baseline" => baseline.except("manifest"),
+  "optimized" => optimized.except("manifest")
+}
+report_path = File.join(TMP_ROOT, "results", options.fetch(:format), "report.json")
+File.write(report_path, JSON.pretty_generate(report))
+
+puts
+puts "Input Ruby files: #{inputs == ["."] ? "all" : inputs.size}"
+puts "| Variant | Parse RSS | Peak RSS | Colored tokens | Live heap slots | Time |"
+puts "| --- | ---: | ---: | ---: | ---: | ---: |"
+[baseline, optimized].each do |result|
+  sample = profile_sample(result, "after_parse")
+  puts "| #{result.fetch("name")} | #{mib(sample.fetch("rss_kb"))} | #{mib(result.fetch("max_rss_kb"))} | #{sample.fetch("colored_tokens")} | #{sample.fetch("heap_live_slots")} | #{format("%.2fs", result.fetch("elapsed_seconds"))} |"
+end
+puts
+puts "Parse RSS reduction: #{percentage(baseline_parse.fetch("rss_kb"), optimized_parse.fetch("rss_kb"))}"
+puts "Peak RSS reduction: #{percentage(baseline.fetch("max_rss_kb"), optimized.fetch("max_rss_kb"))}"
+puts "Outputs identical: #{outputs_match ? "yes" : "NO"}"
+puts "JSON report: #{report_path}"
+
+abort "Generated outputs differ" unless outputs_match
